@@ -1,0 +1,259 @@
+# Build directly on the GitHub runner with caching
+# NOTE: sync spack versions with https://github.com/celeritas-project/spack-gha-buildcache
+# - Spack version
+# - Any required spack patches
+# - Github runner versions
+# - Environment versions at scripts/ci/spack.yaml
+name: build-spack
+on:
+  workflow_dispatch:
+  workflow_call:
+
+concurrency:
+  group: build-spack-${{github.ref}}-${{github.event.pull_request.number || github.run_number}}-${{github.workflow}}
+
+env:
+  SPACK_REF: 866785bd74964142e4b47bf71bee68d7426c84ee # develop@2024-12-31
+
+jobs:
+  spack:
+    name:  >-
+      ${{format('{0}',
+                matrix.special}}
+    strategy:
+      fail-fast: false
+      matrix:
+        special: [null]
+        include:
+          - special: "minimal"
+          - special: "full"
+          - special: "asanlite"
+          - special: "clang-tidy"
+    env:
+      CCACHE_DIR: "${{github.workspace}}/.ccache"
+      CCACHE_MAXSIZE: "100Mi"
+      CMAKE_PRESET: >-
+        ${{format('reldeb-{0}',
+                  matrix.special)}}
+      SPACK_VIEW: "/opt/spack-view"
+      SPACK_BUILDCACHE: "meld-buildcache" # see spack.yaml
+      CC: "clang-18"
+      CXX: "clang++-18"
+      CLANG_TIDY: "clang-tidy-18"
+      CXXSTD: 20
+      runs-on: ubuntu-24.04
+    continue-on-error: false
+    steps:
+      - name: Check out meld
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: ${{format('{0}', matrix.special != 'clang-tidy' && 383 || 0)}}
+          fetch-tags: true # to get version information
+      - name: Setup Spack
+        uses: spack/setup-spack@5792f7c7055c3707819380b5e3831d2be6e64b6c # 2024/12
+        with:
+          ref: ${{env.SPACK_REF}}
+          buildcache: true
+          color: true
+          path: spack-src
+      - name: Patch spack # To be deleted; see associated github pulls
+        working-directory: spack-src
+        run: |
+          for id in 48328 48332 48347 48844 49003 49110 49195; do
+            curl -LfsS "https://github.com/spack/spack/pull/${id}.diff" | patch -p1
+          done
+      - name: Initialize spack environment
+        run: |
+          sed -e 's/cxxstd=default/cxxstd=${{env.CXXSTD}}/' \
+            scripts/ci/spack.yaml > spack.yaml
+          if ${{(matrix.special != 'minimal')
+                && (matrix.special != 'asanlite')
+                && (env.CXXSTD == '20')}}; then
+            spack -e . add root
+          fi
+          spack -vd -e . compiler find --mixed-toolchain
+          # Add the spack ref so that updating spack will reconcretize
+          echo "# Concretized with ${{env.SPACK_REF}}" >> spack.yaml
+      - name: Cache concretization
+        uses: actions/cache@v4
+        with:
+          path: spack.lock
+          key: lock-${{hashFiles('spack.yaml')}}-${{github.run_id}}
+          restore-keys: |
+            lock-${{hashFiles('spack.yaml')}}
+      - name: Concretize
+        run: |
+          spack -e . -v concretize
+      - name: Install dependencies with Spack
+        run: |
+          spack -e . env depfile -o Makefile
+          make -Orecurse -j $(($(nproc) + 1)) SPACK_INSTALL_FLAGS=--no-check-signature
+      - name: Save Spack installation to build cache
+        env:
+          GITHUB_ACTOR: ${{github.actor}}
+          GITHUB_TOKEN: ${{secrets.GITHUB_TOKEN}}
+        run: |
+          # TODO: avoid pushing in the future so that we don't overwrite the spack prefix stuff
+          spack -e . mirror set --push --oci-username-variable GITHUB_ACTOR --oci-password-variable GITHUB_TOKEN ${SPACK_BUILDCACHE}
+          spack -e . buildcache push -j $(($(nproc) + 1)) --base-image ubuntu:22.04 --unsigned --update-index ${SPACK_BUILDCACHE}
+        if: ${{github.event_name == 'push' && !cancelled()}}
+      - name: Activate environment
+        run: |
+          test -d "${SPACK_VIEW}"
+          echo "${SPACK_VIEW}/bin" >> $GITHUB_PATH
+          echo "CMAKE_PREFIX_PATH=${SPACK_VIEW}:${CMAKE_PREFIX_PATH}" >> $GITHUB_ENV
+          spack env activate . --sh > "${SPACK_VIEW}/rc"
+      - name: Restore ccache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{env.CCACHE_DIR}}
+          key: ccache-${{env.CMAKE_PRESET}}-${{matrix.geant}}-${{github.run_id}}
+          restore-keys: |
+            ccache-${{env.CMAKE_PRESET}}-${{matrix.geant}}
+            ccache-${{env.CMAKE_PRESET}}
+      - name: Zero ccache stats
+        run: |
+          ccache -z
+      - name: Configure meld
+        run: |
+          # NOTE: tags have issues, see https://github.com/actions/checkout/issues/2041
+          git fetch --tags
+          ln -fs scripts/cmake-presets/ci-ubuntu-github.json CMakeUserPresets.json
+          if ${{matrix.geant == '11.0'}}; then
+            # Test overriding of Geant4 environment variables
+            . ${SPACK_VIEW}/rc
+            test -n "${G4LEDATA}"
+          fi
+          cmake --preset=${CMAKE_PRESET} --log-level=VERBOSE
+      - name: Run incremental clang-tidy
+        id: clang-tidy
+        if: ${{matrix.special == 'clang-tidy'}}
+        env:
+          BASE_REF: "${{format('{0}', github.base_ref || 'main')}}"
+        run: |
+          if ${{github.event_name == 'schedule'}}; then
+            echo "Full clang-tidy check on scheduled run."
+            ninja -Cbuild -k0
+            exit $?
+          fi
+          BASE=$(git merge-base origin/${BASE_REF} HEAD)
+          ALL_FILES=$(git diff --name-only --diff-filter=ACM "$BASE" HEAD)
+          set +e
+          CC_FILES=$(grep -E '^(src|app)/.*\.cc$' - <<< "$ALL_FILES")
+
+          # Get list of files from compile_commands.json and filter CC_FILES
+          COMPILED_FILES=$(jq -r '.[].file' build/compile_commands.json)
+          CC_FILES=$(echo "$CC_FILES" | while read -r file; do
+            if echo "$COMPILED_FILES" | grep -qE "^.*/${file}$"; then
+              echo "$file"
+            fi
+          done)
+          set -e
+          if [ -z "$CC_FILES" ]; then
+            echo "No files to run clang-tidy on."
+            exit 0
+          fi
+          echo "Running clang-tidy on: $CC_FILES"
+          ${{env.CLANG_TIDY}} -p build $CC_FILES
+          exit $?
+      - name: Build all
+        id: build
+        if: ${{matrix.special != 'clang-tidy'}}
+        working-directory: build
+        run: |
+          ninja -v -k0
+      - name: Save ccache
+        if: ${{always() && steps.build.outcome == 'success'}}
+        uses: actions/cache/save@v4
+        with:
+          path: ${{env.CCACHE_DIR}}
+          key: ccache-${{env.CMAKE_PRESET}}-${{matrix.geant}}-${{github.run_id}}
+      - name: Regenerate ROOT test data
+        if: ${{matrix.geant == '11.0'}}
+        working-directory: build
+        run: |
+          ninja -v -k0 update-root-test-data
+      - name: Run unit tests
+        id: unittest
+        if: ${{matrix.special != 'clang-tidy'}}
+        continue-on-error: ${{fromJSON(matrix.geant || '0') < 11}} # TODO: fix failing tests
+        run: |
+          if ${{matrix.geant == '11.0'}}; then
+            # Note this is ignored for geant4, float, clhep
+            export CELER_TEST_STRICT=1
+          fi
+          ctest -LE app --preset=spack-unit
+      - name: Run app tests
+        id: apptest
+        if: ${{!cancelled()
+            && matrix.special != 'clang-tidy'
+            && steps.build.outcome == 'success'}}
+        continue-on-error: ${{matrix.geant == '10.6'}} # TODO: rogue output from G4DeexPrecoParameters
+        run: |
+          ctest -L app --preset=spack-app
+      - name: Upload test results
+        uses: actions/upload-artifact@v4
+        if: >-
+          ${{
+            always()
+            && (steps.unittest.outcome == 'success'
+                || steps.unittest.outcome == 'failure')
+            && (!matrix.geant || fromJSON(matrix.geant) >= 11)
+          }}
+        with:
+          name: test-results-spack-${{env.CMAKE_PRESET}}-${{matrix.geant}}
+          path: "test-output/**/*.xml"
+          if-no-files-found: error
+          retention-days: 1
+      - name: Check using build directory as install
+        # TODO: ASAN requires flags downstream
+        if: >-
+          ${{
+            (matrix.special != 'asanlite')
+            && (matrix.special != 'clang-tidy')
+          }}
+        env:
+          CELER_DISABLE_ACCEL_EXAMPLES: 1 # Only run minimal example
+        run: |
+          . ${SPACK_VIEW}/rc
+          CELER_INSTALL_DIR=${PWD}/build ./scripts/ci/test-examples.sh
+      - name: Install
+        id: install
+        if: ${{!cancelled() && steps.build.outcome == 'success' && matrix.special != 'clang-tidy'}}
+        working-directory: build
+        run: |
+          ninja install
+      - name: Check installation
+        if: ${{steps.install.outcome == 'success'}}
+        working-directory: install
+        run: |
+          for exe in orange-update celer-export-geant celer-dump-data \
+            celer-sim celer-g4; do
+            test -x "bin/${exe}"
+          done
+          ./bin/celer-sim --version
+      - name: Build examples
+        # TODO: ASAN requires flags downstream
+        env:
+          CELER_DISABLE_ACCEL_EXAMPLES: >-
+            ${{
+              (   (matrix.special == 'minimal')
+               || (matrix.special == 'float')
+               || !matrix.geant
+              ) && '1' || ''
+            }}
+          CELER_GEANT4_VERSION: ${{matrix.geant}}
+        if: >-
+          ${{
+            (matrix.special != 'asanlite')
+            && (matrix.special != 'clang-tidy')
+          }}
+        run: |
+          . ${SPACK_VIEW}/rc
+          ./scripts/ci/test-examples.sh
+      - name: Show ccache stats
+        if: ${{!cancelled()}}
+        run: |
+          ccache -s
+
+# vim: set nowrap tw=100:
